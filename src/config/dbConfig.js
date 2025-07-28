@@ -1,103 +1,116 @@
-const Database = require('better-sqlite3');
-const path = require('path');
-const fs = require('fs');
+const { Readable } = require('stream');
+const { Pool } = require('pg');
 
-const DB_PATH = path.join(__dirname, 'db.sqlite');
+// Use Supabase connection string
+const connectionString = 'postgresql://postgres.rpovxetsvbtkvppdekmj:8bJIrgzHOyCjOceI@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres';
 
-let db;
+let pool;
 
-// Initialize and create table if not exists
-function initDB() {
-    // Ensure file exists (better-sqlite3 will create automatically if not found)
-    db = new Database(DB_PATH);
+async function initAppDB() {
+    pool = new Pool({
+        connectionString,
+        ssl: { rejectUnauthorized: false } // Required by Supabase
+    });
 
-    // Create table if not exists
-    db.prepare(`
-        CREATE TABLE IF NOT EXISTS kv_store (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    `).run();
-
-    console.log('[SQLite] Database initialized at', DB_PATH);
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS kv_store (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+        `);
+        console.log('[PostgreSQL] kv_store table ready ✅');
+    } catch (err) {
+        console.error('[PostgreSQL] Table init error ❌', err.message);
+        throw err;
+    }
 }
 
-// API methods
-const kv = {};
+const db = {};
 
-kv.get = (key) => {
+db.get = async (key) => {
     try {
-        const row = db.prepare('SELECT value FROM kv_store WHERE key = ?').get(key);
-        return row ? row.value : null;
+        const res = await pool.query('SELECT value FROM kv_store WHERE key = $1', [key]);
+        return res.rows[0]?.value ?? null;
     } catch {
         return null;
     }
 };
 
-kv.getMany = (keys) => {
+db.getMany = async (keys) => {
     try {
         if (!keys.length) return [];
-        const placeholders = keys.map(() => '?').join(',');
-        const rows = db.prepare(`SELECT key, value FROM kv_store WHERE key IN (${placeholders})`).all(keys);
-        return rows;
+        const placeholders = keys.map((_, i) => `$${i + 1}`).join(',');
+        const res = await pool.query(`SELECT key, value FROM kv_store WHERE key IN (${placeholders})`, keys);
+        return res.rows;
     } catch {
         return [];
     }
 };
 
-kv.createValueStream = () => {
-    const { Readable } = require('stream');
-    const rows = db.prepare('SELECT value FROM kv_store').all();
-    const stream = new Readable({ objectMode: true, read() { } });
-    rows.forEach(row => stream.push(row.value));
-    stream.push(null);
-    return stream;
+db.createValueStream = async () => {
+    try {
+        const res = await pool.query('SELECT value FROM kv_store');
+        const stream = new Readable({ objectMode: true, read() { } });
+        res.rows.forEach(row => stream.push(row.value));
+        stream.push(null);
+        return stream;
+    } catch {
+        const stream = new Readable({ objectMode: true, read() { } });
+        stream.push(null);
+        return stream;
+    }
 };
 
-kv.createReadStream = () => {
+db.createReadStream = async () => {
     try {
-        return db.prepare('SELECT * FROM kv_store').all();
+        const res = await pool.query('SELECT * FROM kv_store');
+        return res.rows;
     } catch {
         return [];
     }
 };
 
-kv.createKeyStream = () => {
-    const { Readable } = require('stream');
-    const rows = db.prepare('SELECT key FROM kv_store').all();
-    const stream = new Readable({ objectMode: true, read() { } });
-    rows.forEach(row => stream.push(row.key));
-    stream.push(null);
-    return stream;
-};
-
-kv.del = (key) => {
+db.createKeyStream = async () => {
     try {
-        db.prepare('DELETE FROM kv_store WHERE key = ?').run(key);
+        const res = await pool.query('SELECT key FROM kv_store');
+        const stream = new Readable({ objectMode: true, read() { } });
+        res.rows.forEach(row => stream.push(row.key));
+        stream.push(null);
+        return stream;
     } catch {
-        // ignore
+        const stream = new Readable({ objectMode: true, read() { } });
+        stream.push(null);
+        return stream;
     }
 };
 
-kv.put = (key, value) => {
+db.del = async (key) => {
     try {
-        db.prepare(`
-            INSERT INTO kv_store (key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        `).run(key, value);
-    } catch {
-        // ignore
-    }
+        await pool.query('DELETE FROM kv_store WHERE key = $1', [key]);
+    } catch { }
 };
 
-kv.close = () => {
+db.put = async (key, value) => {
     try {
-        db.close();
-        console.log('[SQLite] Connection closed');
+        await pool.query(`
+            INSERT INTO kv_store (key, value)
+            VALUES ($1, $2)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        `, [key, value]);
+    } catch { }
+};
+
+db.close = async () => {
+    try {
+        await pool.end();
     } catch (err) {
-        console.error('[SQLite] Error closing DB', err.message);
+        console.error('[PostgreSQL] Close error ❌', err.message);
     }
 };
 
-initDB();
-module.exports = kv;
+(async () => {
+    await initAppDB();
+})();
+
+module.exports = db;
